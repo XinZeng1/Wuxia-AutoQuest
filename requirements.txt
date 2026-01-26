@@ -1,0 +1,22 @@
+# 图像识别
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# OCR文本识别
+pytesseract>=0.3.10
+easyocr>=1.7.0
+
+# 屏幕截图
+mss>=9.0.1
+
+# 鼠标控制
+pyautogui>=0.9.54
+
+# 配置管理
+pyyaml>=6.0
+
+# 日志
+colorlog>=6.8.0
+
+# Mac Retina 截图支持（可选，Mac 上建议安装以获得更清晰的截图）
+# pyobjc-framework-Quartz>=10.0  # 取消注释以启用 Retina 截图
