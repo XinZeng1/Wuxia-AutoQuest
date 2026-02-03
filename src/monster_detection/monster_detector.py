@@ -7,7 +7,6 @@ import re
 import numpy as np
 from src.ui_interaction.screenshot import Screenshot
 from src.ui_interaction.image_match import ImageMatcher
-from src.ui_interaction.ocr import OCR
 from src.core.config import get_config
 from src.core.logger import get_logger
 
@@ -22,7 +21,6 @@ class MonsterDetector:
         self.config = get_config()
         self.screenshot = Screenshot()
         self.matcher = ImageMatcher()
-        self.ocr = OCR()
         
         # 怪物模板路径（需要在templates目录下放置怪物图标模板）
         # 支持多个模板（列表形式）
@@ -80,9 +78,11 @@ class MonsterDetector:
         
         # 确定使用的检测方法
         detection_method = method if method is not None else self.detection_method
-        
+
         if detection_method == 'name':
             return self._detect_monsters_by_name(screenshot)
+        elif detection_method == 'color':
+            return self._detect_monsters_by_color(screenshot)
         else:
             return self._detect_monsters_by_template(screenshot, template_path, use_all_templates)
     
@@ -167,7 +167,120 @@ class MonsterDetector:
         
         # 转换为PIL Image
         return Image.fromarray(gray)
-    
+
+    def _detect_monsters_by_color(self, screenshot: Image.Image) -> List[Tuple[int, int, float]]:
+        """
+        通过颜色检测黄色文字区域来识别怪物（快速方法）
+
+        Args:
+            screenshot: 屏幕截图
+
+        Returns:
+            怪物位置列表 [(x, y, confidence), ...]
+        """
+        logger.debug("使用颜色检测识别怪物...")
+
+        try:
+            import cv2
+
+            # 转换为numpy数组
+            img_array = np.array(screenshot)
+
+            # 获取窗口尺寸
+            window_width, window_height = self.screenshot.get_window_size()
+
+            # 计算缩放比例（Retina 2x）
+            scale_x = window_width / screenshot.width if screenshot.width > 0 else 1.0
+            scale_y = window_height / screenshot.height if screenshot.height > 0 else 1.0
+
+            # 转换为HSV色彩空间
+            hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
+
+            # 定义黄色的HSV范围
+            lower_yellow = np.array([15, 80, 80])
+            upper_yellow = np.array([35, 255, 255])
+
+            # 创建黄色掩码
+            yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+
+            # 形态学操作：去除噪点
+            kernel = np.ones((3, 3), np.uint8)
+            yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
+            yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+
+            # 查找轮廓
+            contours, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            logger.debug(f"检测到 {len(contours)} 个黄色区域")
+
+            # 过滤轮廓：只保留合理大小的文字区域
+            monsters = []
+            for contour in contours:
+                # 计算轮廓的边界框（物理像素）
+                x, y, w, h = cv2.boundingRect(contour)
+                area = w * h
+
+                # 过滤条件
+                if 50 < area < 5000:  # 面积范围
+                    aspect_ratio = w / h if h > 0 else 0
+                    if 1.5 < aspect_ratio < 15:  # 宽高比范围
+                        # 计算中心点（物理像素）
+                        center_x = x + w // 2
+                        center_y = y + h // 2
+
+                        # 转换为逻辑坐标
+                        center_x_logical = int(center_x * scale_x)
+                        center_y_logical = int(center_y * scale_y)
+
+                        # 排除UI区域（逻辑坐标）
+                        if center_y_logical < 50 or center_y_logical > window_height - 100:
+                            continue
+
+                        # 排除右上角小地图区域
+                        if center_x_logical > window_width - 150 and center_y_logical < 150:
+                            continue
+
+                        # 怪物位置在文字下方（物理像素）
+                        monster_x_physical = center_x
+                        monster_y_physical = center_y + h // 2 + 25
+
+                        # 转换为逻辑坐标
+                        monster_x = int(monster_x_physical * scale_x)
+                        monster_y = int(monster_y_physical * scale_y)
+
+                        # 确保在窗口范围内
+                        if 0 <= monster_x < window_width and 0 <= monster_y < window_height:
+                            monsters.append((monster_x, monster_y, 1.0))
+                            logger.debug(f"检测到怪物: 文字中心({center_x_logical}, {center_y_logical}), 怪物位置({monster_x}, {monster_y})")
+
+            # 去除重复
+            if monsters:
+                filtered_monsters = []
+                for monster in monsters:
+                    x, y, conf = monster
+                    is_duplicate = False
+                    for existing in filtered_monsters:
+                        ex, ey, _ = existing
+                        distance = ((x - ex) ** 2 + (y - ey) ** 2) ** 0.5
+                        if distance < 40:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        filtered_monsters.append(monster)
+
+                monsters = filtered_monsters
+
+            if monsters:
+                logger.info(f"通过颜色检测识别到 {len(monsters)} 个怪物")
+            else:
+                logger.debug("未检测到任何怪物（颜色检测）")
+
+            return monsters
+
+        except Exception as e:
+            logger.error(f"颜色检测失败: {e}", exc_info=True)
+            return []
+
     def _detect_monsters_by_name(
         self,
         screenshot: Image.Image
@@ -194,35 +307,40 @@ class MonsterDetector:
     def _detect_monsters_with_easyocr(self, screenshot: Image.Image) -> List[Tuple[int, int, float]]:
         """
         使用easyocr识别怪物名称
+
+        策略：检测所有包含等级信息的文本，不依赖关键词列表
         """
         logger.debug("使用EasyOCR识别怪物名称...")
-        
+
         try:
             import easyocr
             import numpy as np
-            
+
             # 初始化easyocr（只初始化一次）
             if not hasattr(self, '_easyocr_reader'):
                 logger.debug("初始化EasyOCR...")
-                self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
-            
+                # 使用GPU加速（Apple Silicon的MPS）
+                self._easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
+
             # 转换为numpy数组
             img_array = np.array(screenshot)
-            
+
             # 获取窗口实际尺寸（用于坐标缩放）
             window_width = self.screenshot.get_window_size()[0]
             window_height = self.screenshot.get_window_size()[1]
-            
+
             # 检查是否需要缩放坐标（Retina截图可能返回2x分辨率）
             scale_x = window_width / screenshot.width if screenshot.width > 0 else 1.0
             scale_y = window_height / screenshot.height if screenshot.height > 0 else 1.0
-            
+
             logger.debug(f"截图尺寸: {screenshot.width}x{screenshot.height}, 窗口尺寸: {window_width}x{window_height}")
             logger.debug(f"坐标缩放因子: x={scale_x:.2f}, y={scale_y:.2f}")
-            
+
             # 使用easyocr识别
             results = self._easyocr_reader.readtext(img_array)
-            
+
+            logger.debug(f"OCR识别到 {len(results)} 个文本块")
+
             monsters = []
             for (bbox, text, conf) in results:
                 # bbox是四个点的坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
@@ -231,44 +349,75 @@ class MonsterDetector:
                 y_coords = [point[1] for point in bbox]
                 text_x = int(sum(x_coords) / len(x_coords))
                 text_y = int(sum(y_coords) / len(y_coords))
-                
+
                 # 缩放坐标到窗口尺寸（如果截图是Retina 2x，需要除以2）
                 text_x = int(text_x * scale_x)
                 text_y = int(text_y * scale_y)
-                
+
                 # 计算文本宽度和高度（用于推断怪物位置）
                 text_w = int((max(x_coords) - min(x_coords)) * scale_x)
                 text_h = int((max(y_coords) - min(y_coords)) * scale_y)
-                
-                # 检查文本是否包含怪物名称关键词
+
+                # 判断是否为怪物名称的策略（不依赖关键词）：
                 is_monster_name = False
-                for keyword in self.monster_name_keywords:
-                    if keyword in text:
+                detection_reason = ""
+
+                # 策略1：检测等级格式 - "（XX级）"或"XX级"
+                # 注意：不检测"LvXX"，那是角色级别
+                if re.search(r'\（\d+级\）', text):  # 全角括号
+                    is_monster_name = True
+                    detection_reason = "等级格式（全角括号）"
+                elif re.search(r'\(\d+级\)', text):  # 半角括号
+                    is_monster_name = True
+                    detection_reason = "等级格式（半角括号）"
+                elif re.search(r'\d+级', text):  # 只有"XX级"
+                    # 排除角色级别（如"LV54"）
+                    if not re.search(r'LV|Lv|lv', text):
                         is_monster_name = True
-                        break
-                
-                # 也检查是否包含等级信息
-                if not is_monster_name:
-                    if re.search(r'\d+级|Lv\d+', text):
-                        if len(text) > 2:
+                        detection_reason = "等级格式（XX级）"
+
+                # 策略2：如果配置了关键词，也检查关键词（作为补充）
+                if not is_monster_name and self.monster_name_keywords:
+                    for keyword in self.monster_name_keywords:
+                        if keyword in text:
                             is_monster_name = True
-                
+                            detection_reason = f"关键词匹配（{keyword}）"
+                            break
+
+                # 策略3：检测中文名称+数字的组合（如"少阳派弃徒 74"）
+                # 但要更严格，避免误判UI文本
+                if not is_monster_name:
+                    # 至少包含3个中文字符 + 数字
+                    chinese_chars = re.findall(r'[\u4e00-\u9fff]', text)
+                    has_numbers = re.search(r'\d+', text)
+                    if len(chinese_chars) >= 3 and has_numbers:
+                        # 排除一些明显不是怪物名称的文本
+                        exclude_keywords = ['探索', '奖励', '铜钱', '历练', '家园', '背包', '角色', '完成', '首次', '无字', 'LV', 'Lv']
+                        is_excluded = any(kw in text for kw in exclude_keywords)
+                        # 还要检查文本长度，太长的可能是UI文本
+                        if not is_excluded and len(text) <= 20:
+                            is_monster_name = True
+                            detection_reason = "中文名称+数字"
+
                 if is_monster_name:
-                    # 怪物位置在文字中间下面5px左右
-                    # 文字中心Y = text_y + text_h / 2
-                    # 文字中心下方5px = text_y + text_h / 2 + 5
-                    text_center_y = text_y + text_h / 2
+                    # 怪物位置计算：
+                    # 根据游戏截图，怪物通常在名称文字的正下方
+                    # 文字的底部 y 坐标 = text_y + text_h/2
+                    # 怪物在文字底部下方约 20-30 像素
+                    text_bottom_y = text_y + text_h // 2
                     monster_x = text_x
-                    monster_y = int(text_center_y + 40 * scale_y)  # 文字中心下方5px（按比例缩放）
-                    
-                    # 检查坐标是否在窗口范围内（使用窗口尺寸，不是截图尺寸）
+                    monster_y = text_bottom_y + 25  # 文字底部下方25像素
+
+                    # 检查坐标是否在窗口范围内
                     if 0 <= monster_x < window_width and 0 <= monster_y < window_height:
                         confidence = float(conf)
                         monsters.append((monster_x, monster_y, confidence))
-                        logger.debug(f"检测到怪物名称: '{text}' 位置({monster_x}, {monster_y}), 置信度: {conf:.3f}")
+                        logger.debug(f"检测到怪物: '{text}' ({detection_reason})")
+                        logger.debug(f"  文本位置: ({text_x}, {text_y}), 文本尺寸: {text_w}x{text_h}")
+                        logger.debug(f"  怪物位置: ({monster_x}, {monster_y}), 置信度: {conf:.3f}")
                     else:
                         logger.warning(f"怪物位置超出窗口范围: ({monster_x}, {monster_y}), 窗口尺寸: {window_width}x{window_height}")
-            
+
             # 去除重复的匹配
             if monsters:
                 filtered_monsters = []
@@ -283,18 +432,19 @@ class MonsterDetector:
                             break
                     if not is_duplicate:
                         filtered_monsters.append(monster)
-                
+
                 monsters = filtered_monsters
-            
+
             if monsters:
                 logger.info(f"通过EasyOCR识别检测到 {len(monsters)} 个怪物")
                 for i, monster in enumerate(monsters[:10]):
                     logger.debug(f"  怪物{i+1}: 位置({monster[0]}, {monster[1]}), 置信度: {monster[2]:.3f}")
             else:
                 logger.debug("未检测到任何怪物名称")
-            
+                logger.debug(f"OCR共识别到 {len(results)} 个文本块，但没有匹配到怪物格式")
+
             return monsters
-            
+
         except ImportError:
             logger.error("EasyOCR未安装，请运行: pip install easyocr")
             return []

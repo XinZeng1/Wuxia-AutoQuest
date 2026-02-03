@@ -11,12 +11,12 @@ logger = get_logger(__name__)
 class State(Enum):
     """状态枚举"""
     IDLE = "idle"  # 空闲
-    BOUNDARY_CRUISE = "boundary_cruise"  # A: 边界巡航
-    MOVING_TO_MONSTER = "moving_to_monster"  # B: 精确打击-移动向怪物
+    SCANNING_MONSTERS = "scanning_monsters"  # 扫描怪物
+    MOVING_TO_MONSTER = "moving_to_monster"  # 移动到怪物
     WAITING_FOR_COMBAT = "waiting_for_combat"  # 等待战斗
-    COMBAT = "combat"  # B: 精确打击-战斗中
-    BACKTRACKING = "backtracking"  # C: 原路回溯
-    PAUSED = "paused"  # 暂停
+    COMBAT = "combat"  # 战斗中
+    EXPLORING = "exploring"  # 探索新区域
+    COMPLETED = "completed"  # 探索完成
     STOPPED = "stopped"  # 停止
 
 
@@ -104,7 +104,7 @@ class StateMachine:
     def is_stopped(self) -> bool:
         """检查是否已停止"""
         return self.current_state == State.STOPPED
-    
-    def is_paused(self) -> bool:
-        """检查是否已暂停"""
-        return self.current_state == State.PAUSED
+
+    def is_completed(self) -> bool:
+        """检查是否已完成"""
+        return self.current_state == State.COMPLETED
